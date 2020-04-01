@@ -1,228 +1,206 @@
-# %matplotlib inline
-
+from game import GameState
 import numpy as np
 import random
-
 import MCTS as mc
-from game import GameState
-from loss import softmax_cross_entropy_with_logits
-
 import config
-import loggers as lg
+import logging
+import matplotlib.pyplot as plt
 import time
 
-import matplotlib.pyplot as plt
-from IPython import display
-import pylab as pl
+
+# import pylab as pl
+
+class User:
+    def __init__(self, name, state_size, action_size):
+        self.name = name
+        self.state_size = state_size
+        self.action_size = action_size
+
+    def act(self, state, tau):
+        action = input('Enter your chosen action: ')
+        pi = np.zeros(self.action_size)
+        pi[action] = 1
+        value = None
+        NN_value = None
+        return action, pi, value, NN_value
 
 
-class User():
-	def __init__(self, name, state_size, action_size):
-		self.name = name
-		self.state_size = state_size
-		self.action_size = action_size
+class Agent:
+    def __init__(self, name, state_size, action_size, mcts_simulations, cpuct, model):
+        self.name = name
+        self.state_size = state_size
+        self.action_size = action_size
+        self.cpuct = cpuct
 
-	def act(self, state, tau):
-		action = input('Enter your chosen action: ')
-		pi = np.zeros(self.action_size)
-		pi[action] = 1
-		value = None
-		NN_value = None
-		return (action, pi, value, NN_value)
+        self.MCTSsimulations = mcts_simulations
+        self.model = model
+        self.mcts = None
 
+        self.train_overall_loss = []
+        self.train_value_loss = []
+        self.train_policy_loss = []
+        self.val_overall_loss = []
+        self.val_value_loss = []
+        self.val_policy_loss = []
 
+    def simulate(self):
+        logging.info('ROOT NODE ID : %s', self.mcts.root.state.id)
+        self.mcts.root.state.render(logging)  # GameState
+        logging.info('CURRENT PLAYER...%d', self.mcts.root.state.playerTurn)
 
-class Agent():
-	def __init__(self, name, state_size, action_size, mcts_simulations, cpuct, model):
-		self.name = name
+        # Move the leaf node
+        leaf, value, done, breadcrumbs = self.mcts.moveToLeaf()
+        leaf.state.render(logging)  # GameState
 
-		self.state_size = state_size
-		self.action_size = action_size
+        # Evaluate the leaf node
+        value, breadcrumbs = self.evaluateLeaf(leaf, value, done, breadcrumbs)
 
-		self.cpuct = cpuct
+        # Backfill the value through the tree
+        self.mcts.backFill(leaf, value, breadcrumbs)
 
-		self.MCTSsimulations = mcts_simulations
-		self.model = model
+    def act(self, state, tau):
 
-		self.mcts = None
+        if self.mcts == None or state.id not in self.mcts.tree:
+            self.buildMCTS(state)
+        else:
+            self.changeRootMCTS(state)
 
-		self.train_overall_loss = []
-		self.train_value_loss = []
-		self.train_policy_loss = []
-		self.val_overall_loss = []
-		self.val_value_loss = []
-		self.val_policy_loss = []
+        # run the simulation
+        for sim in range(self.MCTSsimulations):
+            logging.info('***************************')
+            logging.info('****** SIMULATION %d ******', sim + 1)
+            logging.info('***************************')
+            self.simulate()
 
-	
-	def simulate(self):
+        # get action values
+        pi, values = self.getAV(1)
 
-		lg.logger_mcts.info('ROOT NODE...%s', self.mcts.root.state.id)
-		self.mcts.root.state.render(lg.logger_mcts)
-		lg.logger_mcts.info('CURRENT PLAYER...%d', self.mcts.root.state.playerTurn)
+        # pick the action
+        action, value = self.chooseAction(pi, values, tau)
 
-		##### MOVE THE LEAF NODE
-		leaf, value, done, breadcrumbs = self.mcts.moveToLeaf()
-		leaf.state.render(lg.logger_mcts)
+        nextState, _, _ = state.takeAction(action)
 
-		##### EVALUATE THE LEAF NODE
-		value, breadcrumbs = self.evaluateLeaf(leaf, value, done, breadcrumbs)
+        NN_value = -self.get_preds(nextState)[0]
 
-		##### BACKFILL THE VALUE THROUGH THE TREE
-		self.mcts.backFill(leaf, value, breadcrumbs)
+        logging.info('ACTION VALUES...%s', pi)
+        logging.info('CHOSEN ACTION...%d', action)
+        logging.info('MCTS PERCEIVED VALUE...%f', value)
+        logging.info('NN PERCEIVED VALUE...%f', NN_value)
 
+        return action, pi, value, NN_value
 
-	def act(self, state, tau):
+    def get_preds(self, state):
 
-		if self.mcts == None or state.id not in self.mcts.tree:
-			self.buildMCTS(state)
-		else:
-			self.changeRootMCTS(state)
+        # predict the leaf
+        inputToModel = self.model.convert_to_model_input(state)
 
-		#### run the simulation
-		for sim in range(self.MCTSsimulations):
-			lg.logger_mcts.info('***************************')
-			lg.logger_mcts.info('****** SIMULATION %d ******', sim + 1)
-			lg.logger_mcts.info('***************************')
-			self.simulate()
+        preds = self.model.predict(inputToModel)
 
-		#### get action values
-		pi, values = self.getAV(1)
+        value_array = preds[0]
+        logits_array = preds[1]
+        value = value_array[0]
 
-		####pick the action
-		action, value = self.chooseAction(pi, values, tau)
+        logits = logits_array[0]
+        allowedActions = state.allowedActions
 
-		nextState, _, _ = state.takeAction(action)
+        mask = np.ones(logits.shape, dtype=bool)
+        mask[allowedActions] = False
+        logits[mask] = -100
 
-		NN_value = -self.get_preds(nextState)[0]
+        # softmax
+        odds = np.exp(logits)
+        probs = odds / np.sum(odds)  # put this just before the for?
 
-		lg.logger_mcts.info('ACTION VALUES...%s', pi)
-		lg.logger_mcts.info('CHOSEN ACTION...%d', action)
-		lg.logger_mcts.info('MCTS PERCEIVED VALUE...%f', value)
-		lg.logger_mcts.info('NN PERCEIVED VALUE...%f', NN_value)
+        return ((value, probs, allowedActions))
 
-		return (action, pi, value, NN_value)
+    def evaluateLeaf(self, leaf, value, done, breadcrumbs):
+        logging.info('------EVALUATING LEAF------')
 
+        if done == 0:
+            value, probs, allowedActions = self.get_preds(leaf.state)
+            logging.info('PREDICTED VALUE FOR %d: %f', leaf.state.playerTurn, value)
 
-	def get_preds(self, state):
-		#predict the leaf
-		inputToModel = np.array([self.model.convertToModelInput(state)])
+            probs = probs[allowedActions]
 
-		preds = self.model.predict(inputToModel)
-		value_array = preds[0]
-		logits_array = preds[1]
-		value = value_array[0]
+            for idx, action in enumerate(allowedActions):
+                newState, _, _ = leaf.state.takeAction(action)
 
-		logits = logits_array[0]
+                if newState.id not in self.mcts.tree:  # expand
+                    node = mc.Node(newState)
+                    self.mcts.addNode(node)
+                    logging.info('added node...%s...p = %f', node.id, probs[idx])
+                else:
+                    node = self.mcts.tree[newState.id]
+                    logging.info('existing node...%s...', node.id)
 
-		allowedActions = state.allowedActions
+                newEdge = mc.Edge(leaf, node, probs[idx], action)
+                leaf.edges.append((action, newEdge))
 
-		mask = np.ones(logits.shape,dtype=bool)
-		mask[allowedActions] = False
-		logits[mask] = -100
+        else:
+            logging.info('GAME VALUE FOR %d: %f', leaf.playerTurn, value)
 
-		#SOFTMAX
-		odds = np.exp(logits)
-		probs = odds / np.sum(odds) ###put this just before the for?
+        return ((value, breadcrumbs))
 
-		return ((value, probs, allowedActions))
+    def getAV(self, tau):
+        edges = self.mcts.root.edges
+        pi = np.zeros(self.action_size, dtype=np.integer)
+        values = np.zeros(self.action_size, dtype=np.float32)
 
+        for action, edge in edges:
+            pi[action] = pow(edge.stats['N'], 1 / tau)
+            values[action] = edge.stats['Q']
 
-	def evaluateLeaf(self, leaf, value, done, breadcrumbs):
+        pi = pi / (np.sum(pi) * 1.0)
+        return pi, values
 
-		lg.logger_mcts.info('------EVALUATING LEAF------')
+    def chooseAction(self, pi, values, tau):
+        if tau == 0:  # deterministic
+            actions = np.argwhere(pi == max(pi))
+            action = random.choice(actions)[0]
+        else:  # stochastic
+            action_idx = np.random.multinomial(1, pi)
+            action = np.where(action_idx == 1)[0][0]
 
-		if done == 0:
-	
-			value, probs, allowedActions = self.get_preds(leaf.state)
-			lg.logger_mcts.info('PREDICTED VALUE FOR %d: %f', leaf.state.playerTurn, value)
+        value = values[action]
 
-			probs = probs[allowedActions]
+        return action, value
 
-			for idx, action in enumerate(allowedActions):
-				newState, _, _ = leaf.state.takeAction(action)
-				if newState.id not in self.mcts.tree:
-					node = mc.Node(newState)
-					self.mcts.addNode(node)
-					lg.logger_mcts.info('added node...%s...p = %f', node.id, probs[idx])
-				else:
-					node = self.mcts.tree[newState.id]
-					lg.logger_mcts.info('existing node...%s...', node.id)
+    def replay(self, ltmemory):
+        logging.info('******RETRAINING MODEL******')
 
-				newEdge = mc.Edge(leaf, node, probs[idx], action)
-				leaf.edges.append((action, newEdge))
-				
-		else:
-			lg.logger_mcts.info('GAME VALUE FOR %d: %f', leaf.playerTurn, value)
+        import torch
 
-		return ((value, breadcrumbs))
+        for i in range(config.TRAINING_LOOPS):
+            minibatch = random.sample(ltmemory, min(config.BATCH_SIZE, len(ltmemory)))
+            training_states = torch.stack([self.model.convert_to_model_input(row['state']) for row in minibatch])
+            training_targets = {'value_head': np.array([row['value'] for row in minibatch])
+                , 'policy_head': np.array([row['AV'] for row in minibatch])}
 
+            # todo : in original code, they used epoch based on its parameter. do we need?
+            actor_loss, critic_loss = self.model.update(training_states, training_targets)
 
-		
-	def getAV(self, tau):
-		edges = self.mcts.root.edges
-		pi = np.zeros(self.action_size, dtype=np.integer)
-		values = np.zeros(self.action_size, dtype=np.float32)
-		
-		for action, edge in edges:
-			pi[action] = pow(edge.stats['N'], 1/tau)
-			values[action] = edge.stats['Q']
+            actor_loss = actor_loss.item()
+            critic_loss = critic_loss.item()
 
-		pi = pi / (np.sum(pi) * 1.0)
-		return pi, values
+            self.train_value_loss.append(round(critic_loss, 4))
+            self.train_policy_loss.append(round(actor_loss, 4))
 
-	def chooseAction(self, pi, values, tau):
-		if tau == 0:
-			actions = np.argwhere(pi == max(pi))
-			action = random.choice(actions)[0]
-		else:
-			action_idx = np.random.multinomial(1, pi)
-			action = np.where(action_idx==1)[0][0]
+        plt.plot(self.train_value_loss, 'k:')
+        plt.plot(self.train_policy_loss, 'k--')
+        plt.legend(['train_value_loss', 'train_policy_loss'], loc='lower left')
+        plt.savefig('loss.png')
+        print('\n')
 
-		value = values[action]
+    def predict(self, inputToModel):
+        preds = self.model.predict(inputToModel).numpy()
+        return preds
 
-		return action, value
+    def buildMCTS(self, state):
+        logging.info('****** BUILDING NEW MCTS TREE FOR AGENT %s ******', self.name)
+        self.root = mc.Node(state)
+        self.mcts = mc.MCTS(self.root, self.cpuct)
 
-	def replay(self, ltmemory):
-		lg.logger_mcts.info('******RETRAINING MODEL******')
+    def changeRootMCTS(self, state):
+        logging.info('****** CHANGING ROOT OF MCTS TREE TO %s FOR AGENT %s ******', state.id, self.name)
+        self.mcts.root = self.mcts.tree[state.id]
 
-
-		for i in range(config.TRAINING_LOOPS):
-			minibatch = random.sample(ltmemory, min(config.BATCH_SIZE, len(ltmemory)))
-
-			training_states = np.array([self.model.convertToModelInput(row['state']) for row in minibatch])
-			training_targets = {'value_head': np.array([row['value'] for row in minibatch])
-								, 'policy_head': np.array([row['AV'] for row in minibatch])} 
-
-			fit = self.model.fit(training_states, training_targets, epochs=config.EPOCHS, verbose=1, validation_split=0, batch_size = 32)
-			lg.logger_mcts.info('NEW LOSS %s', fit.history)
-
-			self.train_overall_loss.append(round(fit.history['loss'][config.EPOCHS - 1],4))
-			self.train_value_loss.append(round(fit.history['value_head_loss'][config.EPOCHS - 1],4)) 
-			self.train_policy_loss.append(round(fit.history['policy_head_loss'][config.EPOCHS - 1],4)) 
-
-		plt.plot(self.train_overall_loss, 'k')
-		plt.plot(self.train_value_loss, 'k:')
-		plt.plot(self.train_policy_loss, 'k--')
-
-		plt.legend(['train_overall_loss', 'train_value_loss', 'train_policy_loss'], loc='lower left')
-
-		display.clear_output(wait=True)
-		display.display(pl.gcf())
-		pl.gcf().clear()
-		time.sleep(1.0)
-
-		print('\n')
-		self.model.printWeightAverages()
-
-	def predict(self, inputToModel):
-		preds = self.model.predict(inputToModel)
-		return preds
-
-	def buildMCTS(self, state):
-		lg.logger_mcts.info('****** BUILDING NEW MCTS TREE FOR AGENT %s ******', self.name)
-		self.root = mc.Node(state)
-		self.mcts = mc.MCTS(self.root, self.cpuct)
-
-	def changeRootMCTS(self, state):
-		lg.logger_mcts.info('****** CHANGING ROOT OF MCTS TREE TO %s FOR AGENT %s ******', state.id, self.name)
-		self.mcts.root = self.mcts.tree[state.id]
